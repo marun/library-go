@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 var (
@@ -31,4 +33,28 @@ func GenerateNameForTest(t *testing.T, prefix string) string {
 	name = regexp.MustCompile("-+").ReplaceAll(name, []byte("-"))
 	// ensure no `-` at beginning or end
 	return strings.Trim(string(name), "-")
+}
+
+// Poll calls the given function f every given interval
+// until it returns no error or the given timeout occurs.
+// If a timeout occurs, the last observed error is returned
+// or wait.ErrWaitTimeout if no error occurred.
+func Poll(interval, timeout time.Duration, f func() error) error {
+	var lastErr error
+
+	err := wait.Poll(interval, timeout, func() (bool, error) {
+		lastErr = f()
+		if lastErr != nil {
+			return false, nil
+		}
+		return true, nil
+	})
+
+	if err != nil {
+		if err == wait.ErrWaitTimeout && lastErr != nil {
+			err = fmt.Errorf("%v: %v", err, lastErr)
+		}
+	}
+
+	return err
 }
