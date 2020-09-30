@@ -1,10 +1,13 @@
 package resourceapply
 
 import (
+	"context"
 	"fmt"
 
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/klog/v2"
 
+	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
 	"github.com/openshift/api"
@@ -15,6 +18,8 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -193,4 +198,48 @@ func (c *ClientHolder) secretsGetter() corev1client.SecretsGetter {
 		return c.kubeClient.CoreV1()
 	}
 	return v1helpers.CachedSecretGetter(c.kubeClient.CoreV1(), c.kubeInformers)
+}
+
+type ApplyAdapter interface {
+	Create(ctx context.Context, obj runtime.Object, opts metav1.CreateOptions) (runtime.Object, error)
+	Update(ctx context.Context, obj runtime.Object, opts metav1.UpdateOptions) (runtime.Object, error)
+	Get(ctx context.Context, obj runtime.Object, opts metav1.GetOptions) (runtime.Object, error)
+	Kind() string
+	DeepCopy(obj runtime.Object) runtime.Object
+	DeepEqual(obj1 runtime.Object, obj2 runtime.Object) bool
+	MetaObject(obj runtime.Object) metav1.Object
+	ObjectMeta(obj runtime.Object) *metav1.ObjectMeta
+}
+
+// GenericApply merges objectmeta and requires
+func GenericApply(recorder events.Recorder, required runtime.Object, adapter ApplyAdapter) (runtime.Object, bool, error) {
+	existing, err := adapter.Get(context.TODO(), required, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		requiredCopy := adapter.DeepCopy(required)
+		requiredMetaObj := adapter.MetaObject(requiredCopy)
+		actual, err := adapter.Create(context.TODO(), resourcemerge.WithCleanLabelsAndAnnotations(requiredMetaObj).(runtime.Object), metav1.CreateOptions{})
+		reportCreateEvent(recorder, actual, err)
+		return actual, true, err
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	modified := resourcemerge.BoolPtr(false)
+	existingCopy := adapter.DeepCopy(existing)
+	existingObjectMeta := adapter.ObjectMeta(existingCopy)
+
+	resourcemerge.EnsureObjectMeta(modified, existingObjectMeta, *adapter.ObjectMeta(required))
+	contentSame := adapter.DeepEqual(required, existingCopy)
+	if contentSame && !*modified {
+		return existingCopy, false, nil
+	}
+
+	if klog.V(4).Enabled() {
+		klog.Infof("%s %q changes: %v", adapter.Kind(), existingObjectMeta.Name, JSONPatchNoError(existing, existingCopy))
+	}
+
+	actual, err := adapter.Update(context.TODO(), required, metav1.UpdateOptions{})
+	reportUpdateEvent(recorder, required, err)
+	return actual, true, err
 }
