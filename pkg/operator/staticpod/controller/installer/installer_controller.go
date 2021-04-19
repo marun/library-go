@@ -786,7 +786,9 @@ func (c *InstallerController) ensureInstallerPod(nodeName string, operatorSpec *
 	pod.Namespace = c.targetNamespace
 	pod.Name = getInstallerPodName(revision, nodeName, previouslyFailedRevisionPods)
 	pod.Spec.NodeName = nodeName
-	pod.Spec.Containers[0].Image = c.installerPodImageFn()
+	// TODO(marun) Remove this change
+	pod.Spec.Containers[0].Image = "registry.obsidian:5000/ocp/4.3:cluster-kube-apiserver-operator" //c.installerPodImageFn()
+	pod.Spec.Containers[0].ImagePullPolicy = corev1.PullAlways
 	pod.Spec.Containers[0].Command = c.command
 
 	ownerRefs, err := c.ownerRefsFn(revision)
