@@ -31,6 +31,8 @@ type InstallOptions struct {
 	// TODO replace with genericclioptions
 	KubeConfig string
 	KubeClient kubernetes.Interface
+	// Saved on the struct for reuse by InitializeFn
+	ProtoConfig *rest.Config
 
 	Revision  string
 	NodeName  string
@@ -54,13 +56,45 @@ type InstallOptions struct {
 	Timeout time.Duration
 
 	PodMutationFns []PodMutationFunc
+
+	CopyContentFn         CopyContentFunc
+	InitializeFn          InitializeFunc
+	ManifestFilenameFn    ManifestFilenameFunc
+	SubstituteConfigMapFn SubstituteConfigMapFunc
 }
+
+// CopyContentFunc enables custom content copying
+type CopyContentFunc func(resourceDir, podManifestDir string) error
+
+// InitializeFunc supports configuring the options after flags have been parsed
+type InitializeFunc func(ctx context.Context, o *InstallOptions) error
+
+// ManifestFilenameFunc enables customization of the manifest filename
+type ManifestFilenameFunc func(baseFilename string, pod *corev1.Pod) string
 
 // PodMutationFunc is a function that has a chance at changing the pod before it is created
 type PodMutationFunc func(pod *corev1.Pod) error
 
+// SubstituteConfigMapFunc is a function that has a chance at substituting config map content
+type SubstituteConfigMapFunc func(name, key, data string) string
+
 func NewInstallOptions() *InstallOptions {
 	return &InstallOptions{}
+}
+
+func (o *InstallOptions) WithCopyContentFn(copyContentFn CopyContentFunc) *InstallOptions {
+	o.CopyContentFn = copyContentFn
+	return o
+}
+
+func (o *InstallOptions) WithInitializeFn(initializeFn InitializeFunc) *InstallOptions {
+	o.InitializeFn = initializeFn
+	return o
+}
+
+func (o *InstallOptions) WithManifestFilenameFn(manifestFilenameFn ManifestFilenameFunc) *InstallOptions {
+	o.ManifestFilenameFn = manifestFilenameFn
+	return o
 }
 
 func (o *InstallOptions) WithPodMutationFn(podMutationFn PodMutationFunc) *InstallOptions {
@@ -68,9 +102,16 @@ func (o *InstallOptions) WithPodMutationFn(podMutationFn PodMutationFunc) *Insta
 	return o
 }
 
-func NewInstaller() *cobra.Command {
-	o := NewInstallOptions()
+func (o *InstallOptions) WithSubstituteConfigMapFn(substituteConfigMapFn SubstituteConfigMapFunc) *InstallOptions {
+	o.SubstituteConfigMapFn = substituteConfigMapFn
+	return o
+}
 
+func NewInstaller() *cobra.Command {
+	return NewInstallerWithOptions(NewInstallOptions())
+}
+
+func NewInstallerWithOptions(o *InstallOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "installer",
 		Short: "Install static pod and related resources",
@@ -110,7 +151,6 @@ func (o *InstallOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.ResourceDir, "resource-dir", o.ResourceDir, "directory for all files supporting the static pod manifest")
 	fs.StringVar(&o.PodManifestDir, "pod-manifest-dir", o.PodManifestDir, "directory for the static pod manifest")
 	fs.DurationVar(&o.Timeout, "timeout-duration", 120*time.Second, "maximum time in seconds to wait for the copying to complete (default: 2m)")
-
 	fs.StringSliceVar(&o.CertSecretNames, "cert-secrets", o.CertSecretNames, "list of secret names to be included")
 	fs.StringSliceVar(&o.CertConfigMapNamePrefixes, "cert-configmaps", o.CertConfigMapNamePrefixes, "list of configmaps to be included")
 	fs.StringSliceVar(&o.OptionalCertSecretNamePrefixes, "optional-cert-secrets", o.OptionalCertSecretNamePrefixes, "list of optional secret names to be included")
@@ -125,11 +165,11 @@ func (o *InstallOptions) Complete() error {
 	}
 
 	// Use protobuf to fetch configmaps and secrets and create pods.
-	protoConfig := rest.CopyConfig(clientConfig)
-	protoConfig.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
-	protoConfig.ContentType = "application/vnd.kubernetes.protobuf"
+	o.ProtoConfig = rest.CopyConfig(clientConfig)
+	o.ProtoConfig.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
+	o.ProtoConfig.ContentType = "application/vnd.kubernetes.protobuf"
 
-	o.KubeClient, err = kubernetes.NewForConfig(protoConfig)
+	o.KubeClient, err = kubernetes.NewForConfig(o.ProtoConfig)
 	if err != nil {
 		return err
 	}
@@ -259,6 +299,13 @@ func (o *InstallOptions) copySecretsAndConfigMaps(ctx context.Context, resourceD
 }
 
 func (o *InstallOptions) copyContent(ctx context.Context) error {
+	if o.InitializeFn != nil {
+		klog.V(2).Infof("Executing custom initialization ...")
+		if err := o.InitializeFn(ctx, o); err != nil {
+			return err
+		}
+	}
+
 	resourceDir := path.Join(o.ResourceDir, o.nameFor(o.PodConfigMapNamePrefix))
 	klog.Infof("Creating target resource directory %q ...", resourceDir)
 	if err := os.MkdirAll(resourceDir, 0755); err != nil && !os.IsExist(err) {
@@ -312,11 +359,13 @@ func (o *InstallOptions) copyContent(ctx context.Context) error {
 		}
 		podConfigMap = o.substituteConfigMap(podConfigMap)
 		rawPodBytes = podConfigMap.Data["pod.yaml"]
+
 		return true, nil
 	})
 	if err != nil {
 		return err
 	}
+
 	// the kubelet has a bug that prevents graceful termination from working on static pods with the same name, filename
 	// and uuid.  By setting the pod UID we can work around the kubelet bug and get our graceful termination honored.
 	// Per the node team, this is hard to fix in the kubelet, though it will affect all static pods.
@@ -334,9 +383,14 @@ func (o *InstallOptions) copyContent(ctx context.Context) error {
 	}
 	finalPodBytes := resourceread.WritePodV1OrDie(pod)
 
+	podFileName := o.PodConfigMapNamePrefix + ".yaml"
+	if o.ManifestFilenameFn != nil {
+		klog.V(2).Infof("Customizing manifest filename ...")
+		podFileName = o.ManifestFilenameFn(o.PodConfigMapNamePrefix, pod)
+	}
+
 	// Write secrets, config maps and pod to disk
 	// This does not need timeout, instead we should fail hard when we are not able to write.
-	podFileName := o.PodConfigMapNamePrefix + ".yaml"
 	klog.Infof("Writing pod manifest %q ...", path.Join(resourceDir, podFileName))
 	if err := ioutil.WriteFile(path.Join(resourceDir, podFileName), []byte(finalPodBytes), 0644); err != nil {
 		return err
@@ -353,6 +407,13 @@ func (o *InstallOptions) copyContent(ctx context.Context) error {
 		return err
 	}
 
+	if o.CopyContentFn != nil {
+		klog.V(2).Infof("Executing custom content copy ...")
+		if err := o.CopyContentFn(resourceDir, o.PodManifestDir); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -362,6 +423,12 @@ func (o *InstallOptions) substituteConfigMap(obj *corev1.ConfigMap) *corev1.Conf
 		newContent := strings.ReplaceAll(oldContent, "REVISION", o.Revision)
 		newContent = strings.ReplaceAll(newContent, "NODE_NAME", o.NodeName)
 		newContent = strings.ReplaceAll(newContent, "NODE_ENVVAR_NAME", strings.ReplaceAll(strings.ReplaceAll(o.NodeName, "-", "_"), ".", "_"))
+
+		if o.SubstituteConfigMapFn != nil {
+			klog.V(2).Infof("Executing custom config map substitution for %s/%s  ...", obj.Name, k)
+			newContent = o.SubstituteConfigMapFn(obj.Name, k, newContent)
+		}
+
 		ret.Data[k] = newContent
 	}
 	return ret
