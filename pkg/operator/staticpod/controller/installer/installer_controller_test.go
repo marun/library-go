@@ -15,6 +15,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/condition"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/events/eventstesting"
+	"github.com/openshift/library-go/pkg/operator/staticpod/controller"
 	"github.com/openshift/library-go/pkg/operator/staticpod/controller/revision"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
+
+var mirrorPodNameForNode = controller.MirrorPodNameForNode
 
 func TestNewNodeStateForInstallInProgress(t *testing.T) {
 	before := metav1.NewTime(time.Date(2021, 1, 2, 3, 3, 4, 5, time.UTC))
@@ -2216,6 +2219,7 @@ func TestTimeToWait(t *testing.T) {
 				minReadyDuration: test.minReadySeconds,
 				podsGetter:       kubeClient.CoreV1(),
 				clock:            fakeClock,
+				staticPodFn:      controller.GetStaticPod,
 			}
 
 			actual := c.timeToWaitBeforeInstallingNextPod(context.TODO(), nodeStatuses)

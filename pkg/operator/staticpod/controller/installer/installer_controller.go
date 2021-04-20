@@ -19,6 +19,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/management"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceread"
+	"github.com/openshift/library-go/pkg/operator/staticpod/controller"
 	"github.com/openshift/library-go/pkg/operator/staticpod/controller/installer/bindata"
 	"github.com/openshift/library-go/pkg/operator/staticpod/controller/revision"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
@@ -85,6 +86,8 @@ type InstallerController struct {
 	installerPodImageFn func() string
 	// ownerRefsFn sets the ownerrefs on the pruner pod
 	ownerRefsFn func(revision int32) ([]metav1.OwnerReference, error)
+	// staticPodFn returns the static pod for a node.
+	staticPodFn controller.StaticPodFunc
 
 	installerPodMutationFns []InstallerPodMutationFunc
 
@@ -109,6 +112,13 @@ func (c *InstallerController) WithCerts(certDir string, certConfigMaps, certSecr
 	c.certDir = certDir
 	c.certConfigMaps = certConfigMaps
 	c.certSecrets = certSecrets
+	return c
+}
+
+// WithStaticPodAccessorFn overrides retrieval of the static pod for a node in support of
+// apiserver graceful rollout which may temporarily have more than one static pod per node.
+func (c *InstallerController) WithStaticPodAccessorFn(fn controller.StaticPodFunc) *InstallerController {
+	c.staticPodFn = fn
 	return c
 }
 
@@ -157,6 +167,7 @@ func NewInstallerController(
 		clock:               clock.RealClock{},
 	}
 
+	c.staticPodFn = controller.GetStaticPod
 	c.ownerRefsFn = c.setOwnerRefs
 	c.factory = factory.New().WithInformers(operatorClient.Informer(), kubeInformersForTargetNamespace.Core().V1().Pods().Informer())
 
@@ -171,8 +182,13 @@ func (c InstallerController) Name() string {
 	return "InstallerController"
 }
 
+// getStaticPod returns the static pod for a node
+func (c *InstallerController) getStaticPod(ctx context.Context, nodeName string) (*corev1.Pod, error) {
+	return c.staticPodFn(ctx, c.podsGetter, c.targetNamespace, c.staticPodName, nodeName)
+}
+
 func (c *InstallerController) getStaticPodState(ctx context.Context, nodeName string) (state staticPodState, name, revision, reason string, errors []string, err error) {
-	pod, err := c.podsGetter.Pods(c.targetNamespace).Get(ctx, mirrorPodNameForNode(c.staticPodName, nodeName), metav1.GetOptions{})
+	pod, err := c.getStaticPod(ctx, nodeName)
 	if err != nil {
 		return staticPodStatePending, "", "", "", nil, err
 	}
@@ -305,7 +321,7 @@ func (c *InstallerController) timeToWaitBeforeInstallingNextPod(ctx context.Cont
 	// long enough that we would notice if something went really wrong.  Short enough that a customer cluster will still function
 	minDurationPodHasBeenReady := 600 * time.Second
 	for _, nodeStatus := range nodeStatuses {
-		pod, err := c.podsGetter.Pods(c.targetNamespace).Get(ctx, mirrorPodNameForNode(c.staticPodName, nodeStatus.NodeName), metav1.GetOptions{})
+		pod, err := c.getStaticPod(ctx, nodeStatus.NodeName)
 		if err != nil {
 			// if we have an issue getting the static pod, just don't bother delaying for minReadySeconds at all
 			continue
@@ -964,10 +980,6 @@ func (c InstallerController) Sync(ctx context.Context, syncCtx factory.SyncConte
 	}
 
 	return err
-}
-
-func mirrorPodNameForNode(staticPodName, nodeName string) string {
-	return staticPodName + "-" + nodeName
 }
 
 func statusConfigMapNameForRevision(revision int32) string {
