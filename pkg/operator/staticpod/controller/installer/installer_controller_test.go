@@ -1885,13 +1885,13 @@ func TestNodeToStartRevisionWith(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fakeGetStaticPodState := func(ctx context.Context, nodeName string) (state staticPodState, revision, reason string, errs []string, err error) {
+			fakeGetStaticPodState := func(ctx context.Context, nodeName string) (state staticPodState, name, revision, reason string, errs []string, err error) {
 				for _, p := range test.pods {
 					if p.name == nodeName {
-						return p.state, strconv.Itoa(int(p.revision)), "", nil, nil
+						return p.state, "", strconv.Itoa(int(p.revision)), "", nil, nil
 					}
 				}
-				return staticPodStatePending, "", "", nil, errors.NewNotFound(schema.GroupResource{Resource: "pods"}, nodeName)
+				return staticPodStatePending, "", "", "", nil, errors.NewNotFound(schema.GroupResource{Resource: "pods"}, nodeName)
 			}
 			i, _, err := nodeToStartRevisionWith(context.TODO(), fakeGetStaticPodState, test.nodes)
 			if err == nil && test.expectedErr {

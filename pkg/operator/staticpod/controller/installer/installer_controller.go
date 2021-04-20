@@ -171,27 +171,27 @@ func (c InstallerController) Name() string {
 	return "InstallerController"
 }
 
-func (c *InstallerController) getStaticPodState(ctx context.Context, nodeName string) (state staticPodState, revision, reason string, errors []string, err error) {
+func (c *InstallerController) getStaticPodState(ctx context.Context, nodeName string) (state staticPodState, name, revision, reason string, errors []string, err error) {
 	pod, err := c.podsGetter.Pods(c.targetNamespace).Get(ctx, mirrorPodNameForNode(c.staticPodName, nodeName), metav1.GetOptions{})
 	if err != nil {
-		return staticPodStatePending, "", "", nil, err
+		return staticPodStatePending, "", "", "", nil, err
 	}
 	switch pod.Status.Phase {
 	case corev1.PodRunning, corev1.PodSucceeded:
 		for _, c := range pod.Status.Conditions {
 			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-				return staticPodStateReady, pod.Labels[revisionLabel], "static pod is ready", nil, nil
+				return staticPodStateReady, pod.Name, pod.Labels[revisionLabel], "static pod is ready", nil, nil
 			}
 		}
-		return staticPodStatePending, pod.Labels[revisionLabel], "static pod is not ready", nil, nil
+		return staticPodStatePending, pod.Name, pod.Labels[revisionLabel], "static pod is not ready", nil, nil
 	case corev1.PodFailed:
-		return staticPodStateFailed, pod.Labels[revisionLabel], "static pod has failed", []string{pod.Status.Message}, nil
+		return staticPodStateFailed, pod.Name, pod.Labels[revisionLabel], "static pod has failed", []string{pod.Status.Message}, nil
 	}
 
-	return staticPodStatePending, pod.Labels[revisionLabel], fmt.Sprintf("static pod has unknown phase: %v", pod.Status.Phase), nil, nil
+	return staticPodStatePending, pod.Name, pod.Labels[revisionLabel], fmt.Sprintf("static pod has unknown phase: %v", pod.Status.Phase), nil, nil
 }
 
-type staticPodStateFunc func(ctx context.Context, nodeName string) (state staticPodState, revision, reason string, errors []string, err error)
+type staticPodStateFunc func(ctx context.Context, nodeName string) (state staticPodState, name, revision, reason string, errors []string, err error)
 
 // nodeToStartRevisionWith returns a node index i and guarantees for every node < i that it is
 // - not updating
@@ -227,7 +227,7 @@ func nodeToStartRevisionWith(ctx context.Context, getStaticPodStateFn staticPodS
 	oldestNotReadyRevision := math.MaxInt32
 	for i := range nodes {
 		currNodeState := &nodes[i]
-		state, runningRevision, _, _, err := getStaticPodStateFn(ctx, currNodeState.NodeName)
+		state, _, runningRevision, _, _, err := getStaticPodStateFn(ctx, currNodeState.NodeName)
 		if err != nil && apierrors.IsNotFound(err) {
 			return i, fmt.Sprintf("node %s static pod not found", currNodeState.NodeName), nil
 		}
@@ -254,7 +254,7 @@ func nodeToStartRevisionWith(ctx context.Context, getStaticPodStateFn staticPodS
 	oldestPodRevision := math.MaxInt32
 	for i := range nodes {
 		currNodeState := &nodes[i]
-		_, runningRevision, _, _, err := getStaticPodStateFn(ctx, currNodeState.NodeName)
+		_, _, runningRevision, _, _, err := getStaticPodStateFn(ctx, currNodeState.NodeName)
 		if err != nil && apierrors.IsNotFound(err) {
 			return i, fmt.Sprintf("node %s static pod not found", currNodeState.NodeName), nil
 		}
@@ -648,7 +648,7 @@ func (c *InstallerController) newNodeStateForInstallInProgress(ctx context.Conte
 
 	switch installerPod.Status.Phase {
 	case corev1.PodSucceeded:
-		state, currentRevision, staticPodReason, failedErrors, err := c.getStaticPodState(ctx, currNodeState.NodeName)
+		state, name, currentRevision, staticPodReason, failedErrors, err := c.getStaticPodState(ctx, currNodeState.NodeName)
 		if err != nil && apierrors.IsNotFound(err) {
 			// pod not launched yet
 			// TODO: have a timeout here and retry the installer
@@ -679,7 +679,7 @@ func (c *InstallerController) newNodeStateForInstallInProgress(ctx context.Conte
 			now := metav1.NewTime(c.now())
 			ret.LastFailedTime = &now
 			ret.LastFailedCount++
-			ns, name := c.targetNamespace, mirrorPodNameForNode(c.staticPodName, currNodeState.NodeName)
+			ns := c.targetNamespace
 			if len(errors) == 0 {
 				errors = append(errors, fmt.Sprintf("no detailed termination message, see `oc get -oyaml -n %q pods %q`", ns, name))
 			}
